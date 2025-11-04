@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
@@ -23,6 +24,7 @@ import (
 
 	"cloud.google.com/go/profiler"
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -81,6 +83,10 @@ type checkoutService struct {
 
 	paymentSvcAddr string
 	paymentSvcConn *grpc.ClientConn
+
+	//DB connection & store
+	db         *sql.DB
+	orderStore *OrderStore
 }
 
 func main() {
@@ -105,7 +111,26 @@ func main() {
 		port = os.Getenv("PORT")
 	}
 
+	// initialize db connection
+	db, err := initDatabaseConnection()
+	if err != nil {
+		log.Warnf("Database connection failed (continuing without persistence): %v", err)
+	} else {
+		defer db.Close()
+		log.Info("Database connection established")
+
+		// initialize db schema
+		if err := InitDB(db); err != nil {
+			log.Warnf("Failed to initialize database schema: %v", err)
+		}
+	}
+
 	svc := new(checkoutService)
+	svc.db = db
+	if db != nil {
+		svc.orderStore = NewOrderStore(db)
+	}
+
 	mustMapEnv(&svc.shippingSvcAddr, "SHIPPING_SERVICE_ADDR")
 	mustMapEnv(&svc.productCatalogSvcAddr, "PRODUCT_CATALOG_SERVICE_ADDR")
 	mustMapEnv(&svc.cartSvcAddr, "CART_SERVICE_ADDR")
@@ -143,6 +168,59 @@ func main() {
 	log.Infof("starting to listen on tcp: %q", lis.Addr().String())
 	err = srv.Serve(lis)
 	log.Fatal(err)
+}
+
+func initDatabaseConnection() (*sql.DB, error) {
+	// get database config from env or use defaults
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost == "" {
+		dbHost = "localhost"
+	}
+
+	dbPort := os.Getenv("DB_PORT")
+	if dbPort == "" {
+		dbPort = "5432"
+	}
+
+	dbUser := os.Getenv("DB_USER")
+	if dbUser == "" {
+		dbUser = "postgres"
+	}
+
+	dbPassword := os.Getenv("DB_PASSWORD")
+	if dbPassword == "" {
+		dbPassword = "postgres"
+	}
+
+	dbName := os.Getenv("DB_NAME")
+	if dbName == "" {
+		dbName = "orders_db"
+	}
+
+	connStr := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		dbHost, dbPort, dbUser, dbPassword, dbName,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, err
+	}
+
+	// configure connection pool
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
+
+	log.Infof("Connected to PostgreSQL at %s:%s", dbHost, dbPort)
+	return db, nil
 }
 
 func initStats() {
@@ -267,6 +345,16 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		ShippingCost:       prep.shippingCostLocalized,
 		ShippingAddress:    req.Address,
 		Items:              prep.orderItems,
+	}
+
+	// save order to db
+	if cs.orderStore != nil {
+		go func() {
+			if err := cs.orderStore.SaveOrder(ctx, orderID.String(), req.UserId, req.Email,
+				req.Address, req.CreditCard, &total, prep.cartItems, shippingTrackingID); err != nil {
+				log.Warnf("failed to persist order to database: %v", err)
+			}
+		}()
 	}
 
 	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {

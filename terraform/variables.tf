@@ -32,7 +32,7 @@ variable "region" {
 variable "namespace" {
   type        = string
   description = "Kubernetes Namespace in which the Online Boutique resources are to be deployed"
-  default     = "default"
+  default     = "boutique"
 }
 
 variable "filepath_manifest" {
